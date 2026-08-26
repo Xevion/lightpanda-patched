@@ -1,0 +1,112 @@
+name: build
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+jobs:
+  check-upstream:
+    name: check upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      short_sha: ${{ steps.upstream.outputs.short_sha }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: get latest lightpanda-io/browser main commit
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api repos/lightpanda-io/browser/commits/main --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${sha:0:9}" >> "$GITHUB_OUTPUT"
+
+      - name: check whether we already built this commit
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "build-${{ steps.upstream.outputs.short_sha }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: patch and build
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      UPSTREAM_SHA: ${{ needs.check-upstream.outputs.sha }}
+      SHORT_SHA: ${{ needs.check-upstream.outputs.short_sha }}
+    steps:
+      # Checked out at the workspace root so lightpanda's own composite
+      # actions (./.github/actions/...) and zig build commands resolve their
+      # relative paths exactly as they do in lightpanda's own CI.
+      - name: checkout lightpanda-io/browser
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: lightpanda-io/browser
+          ref: ${{ env.UPSTREAM_SHA }}
+          fetch-depth: 0
+
+      - name: checkout our patches
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          path: _lightpanda-patched
+          sparse-checkout: |
+            patches
+          sparse-checkout-cone-mode: false
+
+      - name: apply patch
+        run: |
+          patch=_lightpanda-patched/patches/lightpanda-cdp-user-agent.patch
+          if ! git apply --check "$patch"; then
+            echo "::error::patches/lightpanda-cdp-user-agent.patch no longer applies cleanly to lightpanda-io/browser@${SHORT_SHA}. Upstream likely changed the patched code; the patch needs to be regenerated against the new source."
+            exit 1
+          fi
+          git apply "$patch"
+
+      # Reuse lightpanda's own install/v8-snapshot actions from the checked
+      # out source so this workflow tracks whatever build tooling upstream
+      # currently uses, instead of us re-pinning zig/v8/rust versions here.
+      - uses: ./.github/actions/install
+        with:
+          os: linux
+          arch: x86_64
+
+      - uses: ./.github/actions/v8-snapshot
+        with:
+          os: linux
+          arch: x86_64
+
+      - name: zig build release
+        run: zig build -Dsnapshot_path=../../snapshot.bin -Dprebuilt_v8_path=v8/libc_v8.a -Doptimize=ReleaseFast -Dcpu=x86_64
+
+      - name: rename binary
+        run: mv zig-out/bin/lightpanda lightpanda-x86_64-linux
+
+      - name: publish release
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+        with:
+          allowUpdates: true
+          artifacts: lightpanda-x86_64-linux
+          tag: build-${{ env.SHORT_SHA }}
+          name: build-${{ env.SHORT_SHA }}
+          makeLatest: true
+          body: |
+            Patched build of [lightpanda-io/browser@${{ env.SHORT_SHA }}](https://github.com/lightpanda-io/browser/commit/${{ env.UPSTREAM_SHA }}).
+
+            Patch applied: `patches/lightpanda-cdp-user-agent.patch`

@@ -1,0 +1,95 @@
+diff --git a/src/Config.zig b/src/Config.zig
+index 55968d4..c157377 100644
+--- a/src/Config.zig
++++ b/src/Config.zig
+@@ -978,10 +978,6 @@ pub fn validateUserAgent(ua: []const u8) !void {
+             return error.NonPrintable;
+         }
+     }
+-
+-    if (std.ascii.indexOfIgnoreCase(ua, "mozilla") != null) {
+-        return error.Reserved;
+-    }
+ }
+ 
+ /// Tag names of a Zig enum, so a command's allowed values can't drift from the
+diff --git a/src/cdp/domains/emulation.zig b/src/cdp/domains/emulation.zig
+index 56287d6..cd664e7 100644
+--- a/src/cdp/domains/emulation.zig
++++ b/src/cdp/domains/emulation.zig
+@@ -157,10 +157,6 @@ pub fn setUserAgentOverride(cmd: *CDP.Command) !void {
+     const ua = params.userAgent;
+     Config.validateUserAgent(ua) catch |err| switch (err) {
+         error.NonPrintable => return cmd.sendError(-32602, "User agent contains non-printable characters", .{}),
+-        error.Reserved => {
+-            log.warn(.not_implemented, "Emulation.setUserAgentOverride", .{ .param = "userAgent", .value = ua, .info = "User agent must not contain Mozilla" });
+-            return cmd.sendResult(null, .{});
+-        },
+     };
+ 
+     const bc = cmd.browser_context orelse return error.BrowserContextNotLoaded;
+@@ -187,9 +183,7 @@ test "cdp.Emulation: setUserAgentOverride with valid user agent" {
+     try ctx.expectSentResult(null, .{ .id = 1 });
+ }
+ 
+-test "cdp.Emulation: setUserAgentOverride ignores mozilla" {
+-    testing.silenceLog(&.{.not_implemented});
+-
++test "cdp.Emulation: setUserAgentOverride accepts mozilla" {
+     var ctx = try testing.context();
+     defer ctx.deinit();
+     _ = try ctx.loadBrowserContext(.{ .id = "BID-UA2" });
+@@ -200,13 +194,11 @@ test "cdp.Emulation: setUserAgentOverride ignores mozilla" {
+         .params = .{ .userAgent = "Mozilla/5.0 (Windows NT 10.0)" },
+     });
+ 
+-    try ctx.expectSentResult(null, .{});
+-    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
++    try ctx.expectSentResult(null, .{ .id = 2 });
++    try testing.expectEqual(true, ctx.cdp().browser_context.?.user_agent_changed);
+ }
+ 
+-test "cdp.Emulation: setUserAgentOverride ignores mozilla case insensitive" {
+-    testing.silenceLog(&.{.not_implemented});
+-
++test "cdp.Emulation: setUserAgentOverride accepts mozilla case insensitive" {
+     var ctx = try testing.context();
+     defer ctx.deinit();
+     _ = try ctx.loadBrowserContext(.{ .id = "BID-UA3" });
+@@ -217,8 +209,8 @@ test "cdp.Emulation: setUserAgentOverride ignores mozilla case insensitive" {
+         .params = .{ .userAgent = "MOZILLA/5.0 test" },
+     });
+ 
+-    try ctx.expectSentResult(null, .{});
+-    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
++    try ctx.expectSentResult(null, .{ .id = 3 });
++    try testing.expectEqual(true, ctx.cdp().browser_context.?.user_agent_changed);
+ }
+ 
+ test "cdp.Emulation: setUserAgentOverride rejects non-printable characters" {
+diff --git a/src/cdp/domains/network.zig b/src/cdp/domains/network.zig
+index a08f855..180425d 100644
+--- a/src/cdp/domains/network.zig
++++ b/src/cdp/domains/network.zig
+@@ -680,9 +680,7 @@ test "cdp.network setExtraHTTPHeaders rejects non-printable User-Agent" {
+     try testing.expectEqual("hi", bc.extra_headers.items[0].value);
+ }
+ 
+-test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent" {
+-    testing.silenceLog(&.{.cdp});
+-
++test "cdp.network setExtraHTTPHeaders accepts a Mozilla User-Agent" {
+     var ctx = try testing.context();
+     defer ctx.deinit();
+ 
+@@ -695,7 +693,9 @@ test "cdp.network setExtraHTTPHeaders rejects a Mozilla User-Agent" {
+     });
+ 
+     const bc = ctx.cdp().browser_context.?;
+-    try testing.expectEqual(bc.extra_headers.items.len, 0);
++    try testing.expectEqual(bc.extra_headers.items.len, 1);
++    try testing.expectEqual("User-Agent", bc.extra_headers.items[0].name);
++    try testing.expectEqual("Mozilla/5.0", bc.extra_headers.items[0].value);
+ }
+ 
+ test "cdp.network setExtraHTTPHeaders accepts valid User-Agent" {
