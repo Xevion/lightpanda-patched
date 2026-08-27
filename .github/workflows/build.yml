@@ -62,30 +62,27 @@ jobs:
           ref: ${{ env.UPSTREAM_SHA }}
           fetch-depth: 0
 
-      - name: checkout our patches
+      - name: checkout our patch tool
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           path: _lightpanda-patched
           sparse-checkout: |
-            patches
+            tools/patch
           sparse-checkout-cone-mode: false
-
-      - name: apply patch
-        run: |
-          patch=_lightpanda-patched/patches/lightpanda-cdp-user-agent.patch
-          if ! git apply --check "$patch"; then
-            echo "::error::patches/lightpanda-cdp-user-agent.patch no longer applies cleanly to lightpanda-io/browser@${SHORT_SHA}. Upstream likely changed the patched code; the patch needs to be regenerated against the new source."
-            exit 1
-          fi
-          git apply "$patch"
 
       # Reuse lightpanda's own install/v8-snapshot actions from the checked
       # out source so this workflow tracks whatever build tooling upstream
       # currently uses, instead of us re-pinning zig/v8/rust versions here.
+      # Needed before the patch step too, since that step itself runs on zig.
       - uses: ./.github/actions/install
         with:
           os: linux
           arch: x86_64
+
+      - name: patch (structural, via std.zig.Ast)
+        run: |
+          zig run _lightpanda-patched/tools/patch/main.zig -- .
+          zig fmt src/Config.zig src/cdp/domains/emulation.zig src/cdp/domains/network.zig
 
       - uses: ./.github/actions/v8-snapshot
         with:
@@ -98,15 +95,33 @@ jobs:
       - name: rename binary
         run: mv zig-out/bin/lightpanda lightpanda-x86_64-linux
 
+      # A record of what the structural patch actually changed on this commit,
+      # for browsing without running the tool. Not used to apply anything.
+      - name: record patch diff
+        run: |
+          mkdir -p patches
+          git diff > patches/lightpanda-cdp-user-agent.patch
+
+      - name: upload patch diff artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lightpanda-cdp-user-agent-patch
+          path: patches/lightpanda-cdp-user-agent.patch
+          retention-days: 90
+
       - name: publish release
         uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
           allowUpdates: true
-          artifacts: lightpanda-x86_64-linux
+          artifacts: lightpanda-x86_64-linux,patches/lightpanda-cdp-user-agent.patch
           tag: build-${{ env.SHORT_SHA }}
           name: build-${{ env.SHORT_SHA }}
           makeLatest: true
           body: |
             Patched build of [lightpanda-io/browser@${{ env.SHORT_SHA }}](https://github.com/lightpanda-io/browser/commit/${{ env.UPSTREAM_SHA }}).
 
-            Patch applied: `patches/lightpanda-cdp-user-agent.patch`
+            The patch is applied structurally by `tools/patch/main.zig` (parses each
+            touched file with `std.zig.Ast` and edits the matched nodes in place)
+            rather than from a hand-maintained diff, so it survives upstream
+            reformatting or nearby edits. `lightpanda-cdp-user-agent.patch`, attached
+            below, is the diff this run actually produced against this commit.
