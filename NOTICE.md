@@ -15,18 +15,28 @@ one restriction, so a Mozilla-style user agent can be set through:
 - CDP `Emulation.setUserAgentOverride`,
 - CDP `Network.setExtraHTTPHeaders` with a `User-Agent` header.
 
-Nothing else is changed. The rest of the user agent validation is untouched:
-non-printable characters are still rejected, and the header-smuggling checks in
+All three route through `Config.validateUserAgent`, and every outgoing header
+passes `Transfer.verifyHeader`, which defers to the same function. Removing the
+one rule there is the whole behavioural change.
+
+The rest of the user agent validation is untouched: non-printable characters
+are still rejected, and the header-smuggling checks in
 `Network.setExtraHTTPHeaders` still reject header names that are not valid HTTP
 tokens and values carrying CR, LF or NUL.
+
+The patch additionally updates the upstream tests that assert the old
+behaviour, and the `--user-agent` help text, which would otherwise still tell
+you that Mozilla values are forbidden.
 
 ## Where the modification lives
 
 The change is not stored as a patch file. It is produced by
-[`tools/patch`](tools/patch), which parses each upstream file with
+[`tools/patch`](tools/patch), which parses each upstream Zig file with
 `std.zig.Ast` and edits the matched syntax nodes, so it survives upstream
-reformatting and nearby edits. That directory is the corresponding source of
-the modification, and it is licensed under AGPL-3.0 along with the rest.
+reformatting and nearby edits. The handful of non-Zig sites (two HTML test
+fixtures and the help text) use exact substrings that must match exactly once.
+That directory is the corresponding source of the modification, and it is
+licensed under AGPL-3.0 along with the rest.
 
 Every published release also attaches `lightpanda-cdp-user-agent.patch`, the
 unified diff that the run actually produced against that upstream commit, so

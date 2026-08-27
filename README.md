@@ -19,8 +19,20 @@ curl -L -o lightpanda \
 chmod +x lightpanda
 ```
 
-Each nightly is also published under an immutable `build-<date>-<sha>` tag if
-you need to pin one.
+There are two channels:
+
+| Channel | Tags | Tracks |
+| --- | --- | --- |
+| Nightly | rolling `nightly`, plus immutable `build-<date>-<sha>` | upstream `main`, daily |
+| Released | `<version>-patched`, e.g. `0.3.7-patched` | upstream tagged releases |
+
+Nightly is what this repository is for, so it stays the GitHub "latest" release.
+The `<version>-patched` mirrors exist for pinning to a known upstream release;
+they are never pruned.
+
+Only upstream releases the patch actually applies to are mirrored. Upstream did
+not enforce the user-agent restriction on the CLI until 2026-08-15, so `0.3.7`
+is the oldest mirrorable release, and anything earlier is skipped on purpose.
 
 | Platform | Asset | Support |
 | --- | --- | --- |
@@ -32,13 +44,21 @@ you need to pin one.
 Releases also carry `SHA256SUMS`, build provenance attestation, a
 `build-info.json` recording the exact inputs, and the diff the build produced.
 
+`lightpanda version` identifies a patched binary at runtime: nightlies report
+`1.0.0-nightly-patched.<count>+<sha>`, mirrors report `0.3.7-patched.<count>+<sha>`.
+
 ## How the patch works
 
 The change is not a stored diff. [`tools/patch`](tools/patch) parses each
-upstream file with `std.zig.Ast` and edits the matched syntax nodes, so it
+upstream Zig file with `std.zig.Ast` and edits the matched syntax nodes, so it
 survives upstream reformatting and unrelated nearby edits. Every site must
 resolve to exactly one node; an anchor that matches nothing, or matches more
-than one thing, fails the build rather than being guessed at.
+than one thing, fails the build rather than being guessed at. Two HTML test
+fixtures and the help text are matched as exact substrings, under the same
+must-be-unique rule.
+
+It currently covers 25 sites across 9 files: the restriction itself, every
+upstream test that asserted it, and the `--help` text that documented it.
 
 Patched output is re-rendered through the same renderer `zig fmt` is built on,
 so generated code is formatted by construction.

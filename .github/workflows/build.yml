@@ -1,5 +1,7 @@
 name: build
 
+# The nightly channel: tracks upstream main. Mirrored upstream releases are
+# handled separately by mirror-tags.yml; both call release-build.yml.
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -10,6 +12,7 @@ on:
     paths:
       - "tools/patch/**"
       - ".github/workflows/build.yml"
+      - ".github/workflows/release-build.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -23,14 +26,11 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: build
   cancel-in-progress: false
-
-env:
-  LIGHTPANDA_DISABLE_TELEMETRY: true
 
 jobs:
   resolve:
@@ -39,11 +39,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       sha: ${{ steps.upstream.outputs.sha }}
-      short_sha: ${{ steps.upstream.outputs.short_sha }}
-      date: ${{ steps.upstream.outputs.date }}
       tag: ${{ steps.upstream.outputs.tag }}
       should_build: ${{ steps.decide.outputs.should_build }}
-      reason: ${{ steps.decide.outputs.reason }}
     steps:
       - name: resolve the upstream commit
         id: upstream
@@ -56,8 +53,6 @@ jobs:
           date=$(gh api "repos/lightpanda-io/browser/commits/$sha" --jq .commit.committer.date | cut -dT -f1)
           {
             echo "sha=$sha"
-            echo "short_sha=${sha:0:9}"
-            echo "date=$date"
             # Date-first so the release list sorts chronologically on its own.
             echo "tag=build-$date-${sha:0:9}"
           } >> "$GITHUB_OUTPUT"
@@ -96,393 +91,23 @@ jobs:
           fi
 
           echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
-          echo "reason=$reason" >> "$GITHUB_OUTPUT"
           echo "$reason" >> "$GITHUB_STEP_SUMMARY"
 
-  build:
-    name: build ${{ matrix.arch }}-${{ matrix.os }}
+  nightly:
+    name: nightly
     needs: resolve
     if: needs.resolve.outputs.should_build == 'true'
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
-    # macOS is published on a best-effort basis: a broken macOS leg should not
-    # hold back the Linux binaries that are the point of this repo.
-    continue-on-error: ${{ !matrix.required }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: linux
-            arch: x86_64
-            runner: ubuntu-22.04
-            flags: "-Dorderfile=orderfile/lightpanda.ld -Dcpu=x86_64"
-            required: true
-          # apt.llvm.org publishes no LLVM repo for 22.04 on arm, and the
-          # prebuilt V8 is built for a generic arm64 CPU.
-          - os: linux
-            arch: aarch64
-            runner: ubuntu-24.04-arm
-            flags: "-Dorderfile=orderfile/lightpanda.ld -Dcpu=generic"
-            required: true
-          - os: macos
-            arch: aarch64
-            runner: macos-14
-            flags: ""
-            required: false
-          # The last free x86_64 macOS image; Actions retires the architecture
-          # entirely in late 2027.
-          - os: macos
-            arch: x86_64
-            runner: macos-15-intel
-            flags: ""
-            required: false
-    steps:
-      # Upstream is checked out at the workspace root so its own composite
-      # actions and build commands resolve their relative paths exactly as they
-      # do in upstream CI. Full history is required: build.zig derives the
-      # version's commit count and hash from git.
-      - name: checkout lightpanda-io/browser
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          repository: lightpanda-io/browser
-          ref: ${{ needs.resolve.outputs.sha }}
-          fetch-depth: 0
-
-      - name: checkout the patch tool
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          path: _patched
-          sparse-checkout: tools/patch
-          sparse-checkout-cone-mode: false
-
-      # Reusing upstream's own install action keeps this workflow tracking
-      # whatever zig/v8/rust versions upstream currently builds against,
-      # instead of re-pinning them here. Needed before the patch step too,
-      # since the patch tool itself runs on zig.
-      - uses: ./.github/actions/install
-        with:
-          os: ${{ matrix.os }}
-          arch: ${{ matrix.arch }}
-
-      # The tool renders its output through the same renderer `zig fmt` uses,
-      # so no separate formatting step is needed here.
-      - name: apply the patch
-        run: zig run _patched/tools/patch/main.zig -- .
-
-      - uses: ./.github/actions/v8-snapshot
-        with:
-          os: ${{ matrix.os }}
-          arch: ${{ matrix.arch }}
-
-      - name: zig build release
-        run: |
-          zig build \
-            -Dsnapshot_path=../../snapshot.bin \
-            -Dprebuilt_v8_path=v8/libc_v8.a \
-            -Doptimize=ReleaseFast \
-            -Dversion=nightly-patched \
-            ${{ matrix.flags }}
-
-      - name: rename binary
-        run: mv zig-out/bin/lightpanda lightpanda-${{ matrix.arch }}-${{ matrix.os }}
-
-      - name: upload binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: lightpanda-${{ matrix.arch }}-${{ matrix.os }}
-          path: lightpanda-${{ matrix.arch }}-${{ matrix.os }}
-          retention-days: 7
-
-  upstream-tests:
-    name: upstream test suite
-    needs: resolve
-    if: needs.resolve.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: checkout lightpanda-io/browser
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          repository: lightpanda-io/browser
-          ref: ${{ needs.resolve.outputs.sha }}
-          fetch-depth: 0
-
-      - name: checkout the patch tool
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          path: _patched
-          sparse-checkout: tools/patch
-          sparse-checkout-cone-mode: false
-
-      - uses: ./.github/actions/install
-
-      - name: apply the patch
-        run: zig run _patched/tools/patch/main.zig -- .
-
-      # The patch rewrites upstream's own expectations -- that Mozilla user
-      # agents are now accepted, and that the header survives to
-      # extra_headers. Running the suite is what turns those rewritten
-      # assertions from a claim into a check.
-      - name: zig build test
-        run: zig build -Dprebuilt_v8_path=v8/libc_v8.a test
-
-  smoke:
-    name: user-agent smoke test
-    needs: [resolve, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: download the linux x86_64 binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: lightpanda-x86_64-linux
-
-      - run: chmod +x lightpanda-x86_64-linux
-
-      - name: start a user-agent echo server
-        run: |
-          cat > echo_server.py <<'PY'
-          import http.server, socketserver
-
-          class Handler(http.server.BaseHTTPRequestHandler):
-              def do_GET(self):
-                  with open("received-ua.txt", "w") as f:
-                      f.write(self.headers.get("User-Agent", ""))
-                  body = b"<html><body>ok</body></html>"
-                  self.send_response(200)
-                  self.send_header("Content-Type", "text/html")
-                  self.send_header("Content-Length", str(len(body)))
-                  self.end_headers()
-                  self.wfile.write(body)
-
-              def log_message(self, *args):
-                  pass
-
-          socketserver.TCPServer.allow_reuse_address = True
-          socketserver.TCPServer(("127.0.0.1", 8931), Handler).serve_forever()
-          PY
-          python3 echo_server.py &
-          for _ in $(seq 1 20); do
-            curl -sf http://127.0.0.1:8931/ >/dev/null && break
-            sleep 0.5
-          done
-
-      # The whole point of the patch, asserted against the shipped artifact:
-      # --user-agent routes through the same validateUserAgent the patch edits.
-      - name: a Mozilla user agent is accepted and reaches the wire
-        run: |
-          set -euo pipefail
-          ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-          ./lightpanda-x86_64-linux fetch --dump --user-agent "$ua" http://127.0.0.1:8931/
-          received=$(cat received-ua.txt)
-          echo "server saw: $received"
-          test "$received" = "$ua"
-
-      # The patch must remove only the Mozilla rule. If it ever deletes the
-      # whole validator, this catches it.
-      - name: non-printable user agents are still rejected
-        run: |
-          set -euo pipefail
-          if ./lightpanda-x86_64-linux fetch --dump --user-agent "$(printf 'Bad\x01UA')" http://127.0.0.1:8931/; then
-            echo "expected a non-printable user agent to be rejected"
-            exit 1
-          fi
-
-  record:
-    name: record the patch
-    needs: resolve
-    if: needs.resolve.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: checkout lightpanda-io/browser
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          repository: lightpanda-io/browser
-          ref: ${{ needs.resolve.outputs.sha }}
-
-      - name: checkout the patch tool
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          path: _patched
-          sparse-checkout: tools/patch
-          sparse-checkout-cone-mode: false
-
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-
-      - name: apply the patch
-        run: |
-          set -euo pipefail
-          zig run _patched/tools/patch/main.zig -- . | tee patch-report.txt
-
-      # Recorded straight after patching, before any build step can touch a
-      # tracked file (upstream tracks src/rust/Cargo.lock, which cargo rewrites).
-      - name: record the diff
-        run: git diff > lightpanda-cdp-user-agent.patch
-
-      - name: record build info
-        env:
-          UPSTREAM_SHA: ${{ needs.resolve.outputs.sha }}
-          UPSTREAM_DATE: ${{ needs.resolve.outputs.date }}
-          TAG: ${{ needs.resolve.outputs.tag }}
-        run: |
-          set -euo pipefail
-          action=.github/actions/install/action.yml
-          v8=$(awk -F\' '/^  v8:/{f=1} f&&/default:/{print $2; exit}' "$action")
-          zig_v8=$(awk -F\' '/^  zig-v8:/{f=1} f&&/default:/{print $2; exit}' "$action")
-          jq -n \
-            --arg upstream_repo "lightpanda-io/browser" \
-            --arg upstream_sha "$UPSTREAM_SHA" \
-            --arg upstream_date "$UPSTREAM_DATE" \
-            --arg patcher_repo "$GITHUB_REPOSITORY" \
-            --arg patcher_sha "$GITHUB_SHA" \
-            --arg zig "$(zig version)" \
-            --arg v8 "$v8" \
-            --arg zig_v8 "$zig_v8" \
-            --arg tag "$TAG" \
-            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '$ARGS.named' > build-info.json
-          cat build-info.json
-
-      - name: upload the record
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: patch-record
-          path: |
-            lightpanda-cdp-user-agent.patch
-            patch-report.txt
-            build-info.json
-          retention-days: 90
-
-  release:
-    name: publish
-    needs: [resolve, build, upstream-tests, smoke, record]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
       attestations: write
-    steps:
-      - name: download everything
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: checksum the binaries
-        working-directory: dist
-        run: |
-          set -euo pipefail
-          sha256sum lightpanda-* > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: dist/lightpanda-*
-
-      - name: release notes
-        env:
-          UPSTREAM_SHA: ${{ needs.resolve.outputs.sha }}
-          SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
-        run: |
-          cat > notes.md <<EOF
-          Patched build of [lightpanda-io/browser@${SHORT_SHA}](https://github.com/lightpanda-io/browser/commit/${UPSTREAM_SHA}),
-          built from ${GITHUB_REPOSITORY}@${GITHUB_SHA:0:9}.
-
-          The CDP Mozilla User-Agent restriction is removed by \`tools/patch\`, which
-          parses each touched file with \`std.zig.Ast\` and edits the matched nodes,
-          so it survives upstream reformatting and nearby edits rather than depending
-          on a stored diff. Upstream's own test suite runs against the patched tree,
-          and the published binary is checked end to end for accepting a Mozilla
-          user agent while still rejecting a non-printable one.
-
-          \`lightpanda version\` reports a \`nightly-patched\` pre-release tag, so a
-          patched binary is distinguishable from an official one at runtime.
-
-          Attached: per-platform binaries, \`SHA256SUMS\`, \`build-info.json\` (exact
-          upstream commit, patch tool commit, zig and V8 versions), and
-          \`lightpanda-cdp-user-agent.patch\` (the diff this run produced).
-
-          Built from AGPL-3.0 source; see NOTICE.md for what was modified.
-          EOF
-
-      - name: publish the immutable release
-        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
-        with:
-          allowUpdates: true
-          artifacts: "dist/*"
-          tag: ${{ needs.resolve.outputs.tag }}
-          name: ${{ needs.resolve.outputs.tag }}
-          bodyFile: notes.md
-          makeLatest: false
-
-      # A rolling tag so consumers have a download URL they can hardcode.
-      - name: publish the rolling nightly release
-        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
-        with:
-          allowUpdates: true
-          removeArtifacts: true
-          artifacts: "dist/*"
-          tag: nightly
-          name: nightly
-          bodyFile: notes.md
-          makeLatest: true
-
-      # Without this the release list grows without bound.
-      - name: prune old builds
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("build-"))]
-                  | sort_by(.createdAt) | reverse | .[14:] | .[].tagName' \
-            > stale.txt
-          while read -r tag; do
-            [ -z "$tag" ] && continue
-            echo "deleting $tag"
-            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
-          done < stale.txt
-
-  notify:
-    name: report failure
-    needs: [resolve, build, upstream-tests, smoke, record, release]
-    if: ${{ always() && contains(needs.*.result, 'failure') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
       issues: write
-    steps:
-      # A cron-only pipeline that fails silently is a pipeline nobody notices
-      # has stopped working.
-      - name: open or update the tracking issue
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHORT_SHA: ${{ needs.resolve.outputs.short_sha }}
-        run: |
-          set -euo pipefail
-          {
-            printf 'The patched build failed against upstream commit %s.\n\n' "${SHORT_SHA:-unknown}"
-            printf 'Run: %s/%s/actions/runs/%s\n\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
-            cat <<'EOF'
-          If a patch step reported missing or ambiguous sites, upstream has drifted from
-          what `tools/patch` matches and the anchors need revisiting. Run
-          `just patch-check` locally to see which ones, and `just patch-history` to see
-          when they last matched.
-          EOF
-          } > body.md
-
-          gh label create build-failure --repo "$GITHUB_REPOSITORY" --color B60205 \
-            --description "Automated: the patched build is failing" || true
-
-          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --label build-failure \
-            --state open --limit 1 --json number --jq '.[0].number // empty')
-
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file body.md
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --label build-failure \
-              --title "patched build failing on upstream ${SHORT_SHA:-unknown}" --body-file body.md
-          fi
+    uses: ./.github/workflows/release-build.yml
+    with:
+      upstream_sha: ${{ needs.resolve.outputs.sha }}
+      release_tag: ${{ needs.resolve.outputs.tag }}
+      version: nightly-patched
+      channel: nightly
+      rolling_tag: nightly
+      make_latest: true
+      prune: true

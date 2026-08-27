@@ -25,17 +25,49 @@ pub const Target = enum {
     config,
     emulation,
     network,
+    http_client,
+    xml_http_request,
+    fetch,
+    help_text,
+    xhr_html,
+    fetch_html,
 
     pub fn relPath(self: Target) []const u8 {
         return switch (self) {
             .config => "src/Config.zig",
             .emulation => "src/cdp/domains/emulation.zig",
             .network => "src/cdp/domains/network.zig",
+            .http_client => "src/network/HttpClient.zig",
+            .xml_http_request => "src/browser/webapi/net/XMLHttpRequest.zig",
+            .fetch => "src/browser/webapi/net/Fetch.zig",
+            .help_text => "src/help.zon",
+            .xhr_html => "src/browser/tests/net/xhr.html",
+            .fetch_html => "src/browser/tests/net/fetch.html",
+        };
+    }
+
+    /// Zig sources are edited through the AST; the rest are prose and
+    /// JavaScript, where an exact required-unique substring is the honest
+    /// mechanism rather than a parser that would add nothing.
+    pub fn kind(self: Target) enum { zig, text } {
+        return switch (self) {
+            .config, .emulation, .network, .http_client, .xml_http_request, .fetch => .zig,
+            .help_text, .xhr_html, .fetch_html => .text,
         };
     }
 };
 
-pub const all_targets = [_]Target{ .config, .emulation, .network };
+pub const all_targets = [_]Target{
+    .config,
+    .emulation,
+    .network,
+    .http_client,
+    .xml_http_request,
+    .fetch,
+    .help_text,
+    .xhr_html,
+    .fetch_html,
+};
 
 pub const Status = enum { applied, not_found, ambiguous };
 
@@ -360,13 +392,41 @@ const Builder = struct {
     }
 
     /// Drop the log-silencing call a test only needs while the patched-away
-    /// warning still fires.
-    fn dropSilenceLog(self: *Builder, name: []const u8, test_node: Node.Index) !void {
+    /// warning still fires. `arg_needle`, when given, picks between sibling
+    /// calls to the same function by their argument source.
+    fn dropLogCall(
+        self: *Builder,
+        name: []const u8,
+        test_node: Node.Index,
+        fn_needle: []const u8,
+        arg_needle: ?[]const u8,
+    ) !void {
         var calls: std.ArrayList(Call) = .empty;
         defer freeCalls(self.gpa, &calls);
-        try collectCalls(self.gpa, self.tree, test_node, "silenceLog", &calls);
+        try collectCalls(self.gpa, self.tree, test_node, fn_needle, &calls);
 
-        if (calls.items.len != 1) {
+        var found: Found = .none;
+        for (calls.items) |call| {
+            if (arg_needle) |needle| {
+                if (call.params.len != 1) continue;
+                if (!std.mem.eql(u8, self.tree.getNodeSource(call.params[0]), needle)) continue;
+            }
+            found = found.add(call.node);
+        }
+
+        const node = try self.anchor(name, found) orelse return;
+        try self.deleteStatement(node);
+        try self.applied(name, 1);
+    }
+
+    /// Remove one occurrence of `scope` from a test's declared log
+    /// expectations, for a warning the patch stops emitting.
+    fn dropLogExpectation(self: *Builder, name: []const u8, test_node: Node.Index, scope: []const u8) !void {
+        var calls: std.ArrayList(Call) = .empty;
+        defer freeCalls(self.gpa, &calls);
+        try collectCalls(self.gpa, self.tree, test_node, "expectLog", &calls);
+
+        if (calls.items.len != 1 or calls.items[0].params.len != 1) {
             try self.report.record(
                 self.target,
                 name,
@@ -375,10 +435,100 @@ const Builder = struct {
             );
             return;
         }
-        try self.deleteStatement(calls.items[0].node);
+
+        const init_node = findArrayInitWithin(self.tree, calls.items[0].params[0]) orelse {
+            try self.missing(name);
+            return;
+        };
+
+        var buf: [2]Node.Index = undefined;
+        const init = self.tree.fullArrayInit(&buf, init_node) orelse {
+            try self.missing(name);
+            return;
+        };
+
+        var kept: std.ArrayList([]const u8) = .empty;
+        defer kept.deinit(self.gpa);
+        var dropped = false;
+        for (init.ast.elements) |element| {
+            const src = self.tree.getNodeSource(element);
+            if (!dropped and std.mem.eql(u8, src, scope)) {
+                dropped = true;
+                continue;
+            }
+            try kept.append(self.gpa, src);
+        }
+
+        if (!dropped) {
+            try self.missing(name);
+            return;
+        }
+
+        var rebuilt: std.ArrayList(u8) = .empty;
+        defer rebuilt.deinit(self.gpa);
+        try rebuilt.appendSlice(self.gpa, ".{");
+        for (kept.items, 0..) |src, i| {
+            try rebuilt.appendSlice(self.gpa, if (i == 0) " " else ", ");
+            try rebuilt.appendSlice(self.gpa, src);
+        }
+        try rebuilt.appendSlice(self.gpa, if (kept.items.len == 0) "}" else " }");
+
+        try self.replaceNode(init_node, try self.arena.dupe(u8, rebuilt.items));
+        try self.applied(name, 1);
+    }
+
+    /// Rewrite a comment inside a node. Comments are not AST nodes, so this is
+    /// an exact required-unique substring match; a reworded comment is
+    /// reported rather than left contradicting the code beneath it.
+    fn replaceTextInNode(
+        self: *Builder,
+        name: []const u8,
+        node: Node.Index,
+        needle: []const u8,
+        replacement: []const u8,
+    ) !void {
+        const span = nodeSpan(self.tree, node);
+        const body = self.tree.source[span.start..span.end];
+
+        const at = std.mem.indexOf(u8, body, needle) orelse {
+            try self.missing(name);
+            return;
+        };
+        if (std.mem.indexOf(u8, body[at + needle.len ..], needle) != null) {
+            try self.report.record(self.target, name, .ambiguous, 0);
+            return;
+        }
+
+        try self.replaceSpan(.{
+            .start = span.start + at,
+            .end = span.start + at + needle.len,
+        }, replacement);
         try self.applied(name, 1);
     }
 };
+
+fn findArrayInitWithin(tree: Ast, parent: Node.Index) ?Node.Index {
+    const parent_span = nodeSpan(tree, parent);
+    const tags = tree.nodes.items(.tag);
+    for (tags, 0..) |tag, i| {
+        switch (tag) {
+            .array_init_one,
+            .array_init_one_comma,
+            .array_init_dot_two,
+            .array_init_dot_two_comma,
+            .array_init_dot,
+            .array_init_dot_comma,
+            .array_init,
+            .array_init_comma,
+            => {},
+            else => continue,
+        }
+        const node: Node.Index = @enumFromInt(i);
+        const span = nodeSpan(tree, node);
+        if (span.start >= parent_span.start and span.end <= parent_span.end) return node;
+    }
+    return null;
+}
 
 fn configSites(b: *Builder) !void {
     const guard = "validateUserAgent: mozilla guard";
@@ -438,7 +588,7 @@ fn emulationSites(b: *Builder) !void {
             try b.missing(rename_label);
         }
 
-        try b.dropSilenceLog(try std.fmt.allocPrint(b.arena, "{s}  drop silenceLog", .{label}), node);
+        try b.dropLogCall(try std.fmt.allocPrint(b.arena, "{s}  drop silenceLog", .{label}), node, "silenceLog", null);
 
         // A rejected override replies with a bare result; an accepted one
         // replies against the request id the test itself sent.
@@ -490,7 +640,7 @@ fn networkSites(b: *Builder) !void {
         try b.missing(label ++ "  rename to accepts");
     }
 
-    try b.dropSilenceLog(label ++ "  drop silenceLog", node);
+    try b.dropLogCall(label ++ "  drop silenceLog", node, "silenceLog", null);
 
     const assert_label = label ++ "  assert header kept";
     var calls: std.ArrayList(Call) = .empty;
@@ -529,6 +679,114 @@ fn networkSites(b: *Builder) !void {
     if (rewritten == 0) try b.missing(assert_label) else try b.applied(assert_label, rewritten);
 }
 
+/// `Transfer.verifyHeader` is the central gate every outgoing header passes
+/// through, and it defers to `Config.validateUserAgent`. Removing the guard
+/// there is what lets a Mozilla user agent reach the wire at all, so this test
+/// has to assert the header now survives instead of being dropped.
+fn httpClientSites(b: *Builder) !void {
+    const label = "test: Transfer header layering";
+    const node = try b.anchor(label, findTest(b.tree, "HttpClient: Transfer header layering\"")) orelse return;
+
+    try b.replaceTextInNode(
+        label ++ "  rewrite the stale comment",
+        node,
+        "// an invalid User-Agent never enters the list",
+        "// a Mozilla User-Agent is no longer refused",
+    );
+
+    // The test declares its log expectations twice; the one-line `&.{.http}`
+    // belongs to the warning the patch removes.
+    try b.dropLogCall(label ++ "  drop the dropped-header log expectation", node, "expectLog", "&.{.http}");
+
+    const assert_label = label ++ "  assert the user agent is kept";
+    const ua = findStringLiteral(b.tree, node, "Mozilla") orelse {
+        try b.missing(assert_label);
+        return;
+    };
+
+    var calls: std.ArrayList(Call) = .empty;
+    defer freeCalls(b.gpa, &calls);
+    try collectCalls(b.gpa, b.tree, node, "expectEqual", &calls);
+
+    var found: Found = .none;
+    for (calls.items) |call| {
+        if (call.params.len != 2) continue;
+        if (std.mem.indexOf(u8, b.tree.getNodeSource(call.params[1]), "findRequestHeader(\"user-agent\")") == null) continue;
+        // The sibling assertion in this test checks a different override, so
+        // the expected default is what tells the two apart.
+        if (!std.mem.eql(u8, b.tree.getNodeSource(call.params[0]), "\"Lightpanda/1.0\"")) continue;
+        found = found.add(call.params[0]);
+    }
+
+    const param = try b.anchor(assert_label, found) orelse return;
+    try b.replaceNode(param, ua);
+    try b.applied(assert_label, 1);
+}
+
+/// These suites drive HTML fixtures that set a Mozilla user agent and count
+/// the warnings the run emits. One of those warnings is the dropped header,
+/// which the patch stops producing.
+fn htmlSuiteSites(b: *Builder, test_needle: []const u8, label: []const u8) !void {
+    const node = try b.anchor(label, findTest(b.tree, test_needle)) orelse return;
+    try b.dropLogExpectation(label, node, ".http");
+}
+
+fn xmlHttpRequestSites(b: *Builder) !void {
+    try htmlSuiteSites(b, "WebApi: XHR\"", "test: WebApi XHR  drop one http log expectation");
+}
+
+fn fetchSites(b: *Builder) !void {
+    try htmlSuiteSites(b, "WebApi: fetch\"", "test: WebApi fetch  drop one http log expectation");
+}
+
+const TextEdit = struct {
+    name: []const u8,
+    needle: []const u8,
+    replacement: []const u8,
+};
+
+/// Both fixtures set a Mozilla user agent and then assert it was replaced by
+/// the default. With the restriction gone the header survives, so the two
+/// assertions swap. The neighbouring Sec-Ch-Ua assertions are deliberately
+/// untouched: that header is pinned for reasons unrelated to this patch.
+const ua_fixture_edits = [_]TextEdit{
+    .{
+        .name = "fixture: the default no longer replaces the user agent",
+        .needle = "testing.expectEqual(true, got['user-agent'].includes('Lightpanda'));",
+        .replacement = "testing.expectEqual(false, got['user-agent'].includes('Lightpanda'));",
+    },
+    .{
+        .name = "fixture: the Mozilla user agent reaches the wire",
+        .needle = "testing.expectEqual(false, got['user-agent'].includes('Mozilla'));",
+        .replacement = "testing.expectEqual(true, got['user-agent'].includes('Mozilla'));",
+    },
+};
+
+/// The shipped binary documents the restriction in `--help`, which the patch
+/// makes untrue.
+const help_text_edits = [_]TextEdit{
+    .{
+        .name = "help: drop the forbidden-Mozilla wording",
+        .needle =
+        \\    \\          Override the User-Agent header entirely. Must not impersonate other
+        \\    \\          browsers; any value containing "Mozilla" is forbidden. The browser
+        \\    \\          still sends Sec-Ch-Ua. Incompatible with --user-agent-suffix.
+        ,
+        .replacement =
+        \\    \\          Override the User-Agent header entirely. The browser still sends
+        \\    \\          Sec-Ch-Ua. Incompatible with --user-agent-suffix.
+        ,
+    },
+};
+
+fn textEditsFor(target: Target) []const TextEdit {
+    return switch (target) {
+        .help_text => &help_text_edits,
+        .xhr_html, .fetch_html => &ua_fixture_edits,
+        else => unreachable,
+    };
+}
+
 fn applyEdits(gpa: Allocator, source: []const u8, edits: []const Edit) ![]u8 {
     const sorted = try gpa.dupe(Edit, edits);
     defer gpa.free(sorted);
@@ -559,6 +817,8 @@ pub fn patchSource(gpa: Allocator, target: Target, source: [:0]const u8, report:
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
+    if (target.kind() == .text) return patchText(gpa, target, source, report);
+
     var tree = try Ast.parse(gpa, source, .zig);
     defer tree.deinit(gpa);
     if (tree.errors.len != 0) {
@@ -579,6 +839,10 @@ pub fn patchSource(gpa: Allocator, target: Target, source: [:0]const u8, report:
         .config => try configSites(&builder),
         .emulation => try emulationSites(&builder),
         .network => try networkSites(&builder),
+        .http_client => try httpClientSites(&builder),
+        .xml_http_request => try xmlHttpRequestSites(&builder),
+        .fetch => try fetchSites(&builder),
+        .help_text, .xhr_html, .fetch_html => unreachable,
     }
 
     // Two sites resolving to overlapping spans is a bug in this tool, not
@@ -605,6 +869,32 @@ pub fn patchSource(gpa: Allocator, target: Target, source: [:0]const u8, report:
     }
 
     return out_tree.renderAlloc(gpa);
+}
+
+/// Non-Zig targets: each edit must match exactly once, so a reworded fixture
+/// or help string is reported rather than silently skipped.
+fn patchText(gpa: Allocator, target: Target, source: [:0]const u8, report: *Report) ![]u8 {
+    var edits: std.ArrayList(Edit) = .empty;
+    defer edits.deinit(gpa);
+
+    for (textEditsFor(target)) |edit| {
+        const at = std.mem.indexOf(u8, source, edit.needle) orelse {
+            try report.record(target, edit.name, .not_found, 0);
+            continue;
+        };
+        if (std.mem.indexOf(u8, source[at + edit.needle.len ..], edit.needle) != null) {
+            try report.record(target, edit.name, .ambiguous, 0);
+            continue;
+        }
+        try edits.append(gpa, .{
+            .start = at,
+            .end = at + edit.needle.len,
+            .replacement = edit.replacement,
+        });
+        try report.record(target, edit.name, .applied, 1);
+    }
+
+    return applyEdits(gpa, source, edits.items);
 }
 
 const testing = std.testing;
@@ -867,6 +1157,91 @@ test "network: the smuggling sibling is left alone" {
         \\}
         \\
     );
+}
+
+test "http client: the header-dropped assertion is flipped, its sibling is not" {
+    try expectPatch(.http_client,
+        \\const testing = @import("../testing.zig");
+        \\
+        \\test "HttpClient: Transfer header layering" {
+        \\    var transfer = testTransfer(arena);
+        \\
+        \\    testing.expectLog(&.{ .http, .http });
+        \\    try transfer.setHeader("sec-ch-ua", "\"Chromium\";v=\"140\"", .{ .source = .cdp });
+        \\    try testing.expectEqual("\"Lightpanda\";v=\"1\"", transfer.findRequestHeader("sec-ch-ua").?);
+        \\
+        \\    // an invalid User-Agent never enters the list
+        \\    testing.expectLog(&.{.http});
+        \\    try transfer.setHeader("user-agent", "Mozilla/5.0", .{ .source = .author });
+        \\    try testing.expectEqual("Lightpanda/1.0", transfer.findRequestHeader("user-agent").?);
+        \\
+        \\    // a valid author User-Agent replaces the default
+        \\    try transfer.setHeader("User-Agent", "MyBot/2.0", .{ .source = .author });
+        \\    try testing.expectEqual("MyBot/2.0", transfer.findRequestHeader("user-agent").?);
+        \\}
+        \\
+    ,
+        \\const testing = @import("../testing.zig");
+        \\
+        \\test "HttpClient: Transfer header layering" {
+        \\    var transfer = testTransfer(arena);
+        \\
+        \\    testing.expectLog(&.{ .http, .http });
+        \\    try transfer.setHeader("sec-ch-ua", "\"Chromium\";v=\"140\"", .{ .source = .cdp });
+        \\    try testing.expectEqual("\"Lightpanda\";v=\"1\"", transfer.findRequestHeader("sec-ch-ua").?);
+        \\
+        \\    // a Mozilla User-Agent is no longer refused
+        \\    try transfer.setHeader("user-agent", "Mozilla/5.0", .{ .source = .author });
+        \\    try testing.expectEqual("Mozilla/5.0", transfer.findRequestHeader("user-agent").?);
+        \\
+        \\    // a valid author User-Agent replaces the default
+        \\    try transfer.setHeader("User-Agent", "MyBot/2.0", .{ .source = .author });
+        \\    try testing.expectEqual("MyBot/2.0", transfer.findRequestHeader("user-agent").?);
+        \\}
+        \\
+    );
+}
+
+test "expectLog loses exactly one scope, keeping the others" {
+    try expectPatch(.fetch,
+        \\test "WebApi: fetch" {
+        \\    testing.expectLog(&.{ .http, .js, .http });
+        \\    try testing.htmlRunner("net/fetch.html", .{});
+        \\}
+        \\
+    ,
+        \\test "WebApi: fetch" {
+        \\    testing.expectLog(&.{ .js, .http });
+        \\    try testing.htmlRunner("net/fetch.html", .{});
+        \\}
+        \\
+    );
+}
+
+test "fixtures swap the user-agent assertions and leave sec-ch-ua alone" {
+    try expectPatch(.xhr_html,
+        \\      testing.expectEqual('a, b', got['x-multi']);
+        \\      testing.expectEqual(true, got['user-agent'].includes('Lightpanda'));
+        \\      testing.expectEqual(false, got['user-agent'].includes('Mozilla'));
+        \\      testing.expectEqual(true, got['sec-ch-ua'].includes('Lightpanda'));
+        \\      testing.expectEqual(false, got['sec-ch-ua'].includes('Chromium'));
+        \\
+    ,
+        \\      testing.expectEqual('a, b', got['x-multi']);
+        \\      testing.expectEqual(false, got['user-agent'].includes('Lightpanda'));
+        \\      testing.expectEqual(true, got['user-agent'].includes('Mozilla'));
+        \\      testing.expectEqual(true, got['sec-ch-ua'].includes('Lightpanda'));
+        \\      testing.expectEqual(false, got['sec-ch-ua'].includes('Chromium'));
+        \\
+    );
+}
+
+test "a reworded help string is reported, not silently skipped" {
+    try expectFailedSite(.help_text,
+        \\    \\  --user-agent <STRING>
+        \\    \\          Override the User-Agent header. Mozilla values are rejected.
+        \\
+    , "help: drop the forbidden-Mozilla wording", .not_found);
 }
 
 test "a missing anchor is reported, not guessed" {

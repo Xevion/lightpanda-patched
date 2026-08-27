@@ -1,0 +1,165 @@
+name: mirror upstream tags
+
+# Watches lightpanda-io/browser for new tagged releases and republishes each as
+# a patched build under <tag>-patched. Nightly tracking of upstream main lives
+# in build.yml; both call release-build.yml so the two channels are verified
+# identically.
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Mirror one specific upstream tag instead of discovering new ones"
+        required: false
+        default: ""
+      force:
+        description: "Mirror even if this tag was already published"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-tags
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: discover new upstream releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      targets: ${{ steps.preflight.outputs.targets }}
+      any: ${{ steps.preflight.outputs.any }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # The patch tool is compiled against whatever Zig upstream currently
+      # requires, so its manifest is what setup-zig reads.
+      - name: fetch upstream's zig requirement
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/lightpanda-io/browser/contents/build.zig.zon \
+            -H "Accept: application/vnd.github.raw" > build.zig.zon
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      - name: list candidate tags
+        id: candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ONLY_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$ONLY_TAG" ]; then
+            jq -n --arg tag "$ONLY_TAG" '[{tag: $tag}]' > candidates.json
+            cat candidates.json
+            exit 0
+          fi
+
+          # Real published releases only. Upstream also carries rolling
+          # `nightly`, `beta` and `alpha` tags, and switched tag format from
+          # v0.2.6 to a bare 0.2.7 in early 2026, so both spellings are matched.
+          gh api repos/lightpanda-io/browser/releases --paginate \
+            --jq '.[] | select(.draft == false and .prerelease == false)
+                 | select(.tag_name | test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                 | {tag: .tag_name, published: .published_at}' \
+            | jq -s 'sort_by(.published) | reverse' > upstream.json
+
+          if [ "$FORCE" = "true" ]; then
+            jq '[]' > mine.json
+          else
+            gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName \
+              --jq '[.[].tagName | select(endswith("-patched")) | sub("-patched$"; "")]' > mine.json
+          fi
+
+          # Only tags newer than the newest one already mirrored, so historical
+          # releases are never reconsidered. With nothing mirrored yet, start
+          # from the single newest release rather than the whole back catalogue.
+          jq --slurpfile mine mine.json '
+            ($mine[0]) as $m
+            | ([ to_entries[] | select(.value.tag as $t | ($m | index($t)) != null) | .key ] | min) as $idx
+            | (if $idx == null then .[0:1] else .[0:$idx] end)
+            | .[0:3]
+          ' upstream.json > candidates.json
+          cat candidates.json
+
+      # Most upstream releases predate the code this patch edits, and a future
+      # one could refactor past its anchors. Checking here costs seconds and
+      # avoids spinning up four build legs for a tag that cannot be patched.
+      - name: check the patch applies to each candidate
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ONLY_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          targets=$(zig run tools/patch/main.zig -- --targets)
+          : > kept.jsonl
+
+          for tag in $(jq -r '.[].tag' candidates.json); do
+            sha=$(gh api "repos/lightpanda-io/browser/commits/$tag" --jq .sha)
+            tree="work/$tag"
+            rm -rf "$tree"
+            for f in $targets; do
+              mkdir -p "$tree/$(dirname "$f")"
+              gh api "repos/lightpanda-io/browser/contents/$f?ref=$sha" \
+                -H "Accept: application/vnd.github.raw" > "$tree/$f"
+            done
+
+            if zig run tools/patch/main.zig -- --check "$tree"; then
+              echo "$tag (${sha:0:9}): mirroring" >> "$GITHUB_STEP_SUMMARY"
+              # Leading `v` is stripped so -Dversion parses as a semver and the
+              # binary reports e.g. 0.3.7-patched.3280+5b0835f5a.
+              jq -n \
+                --arg sha "$sha" \
+                --arg release_tag "${tag}-patched" \
+                --arg version "${tag#v}-patched" \
+                '$ARGS.named' >> kept.jsonl
+            else
+              echo "$tag (${sha:0:9}): skipped, the patch does not apply" >> "$GITHUB_STEP_SUMMARY"
+              if [ -n "$ONLY_TAG" ]; then
+                echo "explicitly requested tag $tag cannot be patched"
+                exit 1
+              fi
+            fi
+          done
+
+          targets_json=$(jq -s -c '.' kept.jsonl)
+          echo "targets=$targets_json" >> "$GITHUB_OUTPUT"
+          if [ "$(jq -s 'length' kept.jsonl)" -gt 0 ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  mirror:
+    name: mirror ${{ matrix.target.release_tag }}
+    needs: discover
+    if: needs.discover.outputs.any == 'true'
+    strategy:
+      fail-fast: false
+      # One at a time: each mirror is four build legs plus the test suite.
+      max-parallel: 1
+      matrix:
+        target: ${{ fromJson(needs.discover.outputs.targets) }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      issues: write
+    uses: ./.github/workflows/release-build.yml
+    with:
+      upstream_sha: ${{ matrix.target.sha }}
+      release_tag: ${{ matrix.target.release_tag }}
+      version: ${{ matrix.target.version }}
+      channel: release
+      # The nightly channel stays this repository's "latest"; mirrored tags are
+      # for pinning to a known upstream release.
+      make_latest: false
