@@ -67,7 +67,7 @@ jobs:
             required: true
           - os: macos
             arch: aarch64
-            runner: macos-14
+            runner: macos-15
             flags: ""
             required: false
           # The last free x86_64 macOS image; Actions retires the architecture
