@@ -42,6 +42,9 @@ earlier is skipped on purpose.
 | macOS aarch64 | `lightpanda-aarch64-macos` | best effort |
 | macOS x86_64 | `lightpanda-x86_64-macos` | best effort |
 
+The Linux binaries need glibc 2.28 or newer (RHEL 8, Debian 10, Ubuntu 18.10
+and later). CI fails any build that links against a newer glibc symbol.
+
 Releases also carry `SHA256SUMS`, build provenance attestation, a
 `build-info.json` recording the exact inputs, and the diff the build produced.
 

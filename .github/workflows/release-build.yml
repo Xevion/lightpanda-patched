@@ -52,18 +52,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Linux binaries name their glibc in -Dtarget, so the floor is fixed
+        # here rather than by the runner image's own glibc. The prebuilt V8
+        # needs memfd_create (2.27); 2.28 is the RHEL 8 / manylinux_2_28 line.
         include:
           - os: linux
             arch: x86_64
-            runner: ubuntu-22.04
-            flags: "-Dorderfile=orderfile/lightpanda.ld -Dcpu=x86_64"
+            runner: ubuntu-latest
+            glibc: "2.28"
+            flags: "-Dorderfile=orderfile/lightpanda.ld -Dtarget=x86_64-linux-gnu.2.28 -Dcpu=x86_64"
             required: true
           # apt.llvm.org publishes no LLVM repo for 22.04 on arm, and the
           # prebuilt V8 is built for a generic arm64 CPU.
           - os: linux
             arch: aarch64
             runner: ubuntu-24.04-arm
-            flags: "-Dorderfile=orderfile/lightpanda.ld -Dcpu=generic"
+            glibc: "2.28"
+            flags: "-Dorderfile=orderfile/lightpanda.ld -Dtarget=aarch64-linux-gnu.2.28 -Dcpu=generic"
             required: true
           # A moving label, so a retired image can't strand this leg.
           - os: macos
@@ -127,6 +132,20 @@ jobs:
 
       - name: rename binary
         run: mv zig-out/bin/lightpanda lightpanda-${{ matrix.arch }}-${{ matrix.os }}
+
+      - name: check the glibc floor
+        if: matrix.os == 'linux'
+        env:
+          BIN: lightpanda-${{ matrix.arch }}-${{ matrix.os }}
+          FLOOR: ${{ matrix.glibc }}
+        run: |
+          set -euo pipefail
+          newest=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)
+          echo "newest glibc symbol: $newest, floor: $FLOOR"
+          if [ "$(printf '%s\n%s\n' "$newest" "$FLOOR" | sort -V | tail -n1)" != "$FLOOR" ]; then
+            echo "::error::$BIN needs glibc $newest, above the $FLOOR floor"
+            exit 1
+          fi
 
       # Artifact names carry the release tag: mirror-tags.yml can call this
       # workflow several times in one run, and same-named artifacts would
