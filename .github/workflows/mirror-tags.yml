@@ -163,3 +163,16 @@ jobs:
       # The nightly channel stays this repository's "latest"; mirrored tags are
       # for pinning to a known upstream release.
       make_latest: false
+
+  # See the keepalive job in build.yml.
+  keepalive:
+    name: keep the schedule enabled
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/mirror-tags.yml/enable"
