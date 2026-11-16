@@ -120,7 +120,7 @@ jobs:
           zig build \
             -Dsnapshot_path=../../snapshot.bin \
             -Dprebuilt_v8_path=v8/libc_v8.a \
-            -Doptimize=ReleaseFast \
+            -Doptimize=fast \
             -Dversion=${{ inputs.version }} \
             ${{ matrix.flags }}
 
@@ -215,7 +215,7 @@ jobs:
         run: |
           set -euo pipefail
           ua="Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-          ./lightpanda-x86_64-linux fetch --dump --user-agent "$ua" http://127.0.0.1:8931/
+          ./lightpanda-x86_64-linux fetch --dump html --user-agent "$ua" http://127.0.0.1:8931/
           received=$(cat received-ua.txt)
           echo "server saw: $received"
           test "$received" = "$ua"
@@ -225,7 +225,7 @@ jobs:
       - name: non-printable user agents are still rejected
         run: |
           set -euo pipefail
-          if ./lightpanda-x86_64-linux fetch --dump --user-agent "$(printf 'Bad\x01UA')" http://127.0.0.1:8931/; then
+          if ./lightpanda-x86_64-linux fetch --dump html --user-agent "$(printf 'Bad\x01UA')" http://127.0.0.1:8931/; then
             echo "expected a non-printable user agent to be rejected"
             exit 1
           fi
