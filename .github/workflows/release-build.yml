@@ -65,13 +65,14 @@ jobs:
             runner: ubuntu-24.04-arm
             flags: "-Dorderfile=orderfile/lightpanda.ld -Dcpu=generic"
             required: true
+          # A moving label, so a retired image can't strand this leg.
           - os: macos
             arch: aarch64
-            runner: macos-15
+            runner: macos-latest
             flags: ""
             required: false
-          # The last free x86_64 macOS image; Actions retires the architecture
-          # entirely in late 2027.
+          # No moving label exists for free x86_64 macOS, and this is the last
+          # such image; Actions retires the architecture in late 2027.
           - os: macos
             arch: x86_64
             runner: macos-15-intel
