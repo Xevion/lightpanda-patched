@@ -26,8 +26,6 @@ pub const Target = enum {
     emulation,
     network,
     http_client,
-    xml_http_request,
-    fetch,
     help_text,
     xhr_html,
     fetch_html,
@@ -35,11 +33,9 @@ pub const Target = enum {
     pub fn relPath(self: Target) []const u8 {
         return switch (self) {
             .config => "src/Config.zig",
-            .emulation => "src/cdp/domains/emulation.zig",
-            .network => "src/cdp/domains/network.zig",
+            .emulation => "src/server/cdp/domains/emulation.zig",
+            .network => "src/server/cdp/domains/network.zig",
             .http_client => "src/network/HttpClient.zig",
-            .xml_http_request => "src/browser/webapi/net/XMLHttpRequest.zig",
-            .fetch => "src/browser/webapi/net/Fetch.zig",
             .help_text => "src/help.zon",
             .xhr_html => "src/browser/tests/net/xhr.html",
             .fetch_html => "src/browser/tests/net/fetch.html",
@@ -51,7 +47,7 @@ pub const Target = enum {
     /// mechanism rather than a parser that would add nothing.
     pub fn kind(self: Target) enum { zig, text } {
         return switch (self) {
-            .config, .emulation, .network, .http_client, .xml_http_request, .fetch => .zig,
+            .config, .emulation, .network, .http_client => .zig,
             .help_text, .xhr_html, .fetch_html => .text,
         };
     }
@@ -62,8 +58,6 @@ pub const all_targets = [_]Target{
     .emulation,
     .network,
     .http_client,
-    .xml_http_request,
-    .fetch,
     .help_text,
     .xhr_html,
     .fetch_html,
@@ -197,7 +191,7 @@ fn findTest(tree: Ast, name_needle: []const u8) Found {
     const tags = tree.nodes.items(.tag);
     for (tags, 0..) |tag, i| {
         if (tag != .test_decl) continue;
-        const node: Node.Index = @enumFromInt(i);
+        const node: Node.Index = @fromBackingInt(@intCast(i));
         const name_tok = tree.nodeData(node).opt_token_and_node[0].unwrap() orelse continue;
         if (std.mem.indexOf(u8, tree.tokenSlice(name_tok), name_needle) != null) {
             found = found.add(node);
@@ -211,7 +205,7 @@ fn findIfGuard(tree: Ast, cond_needle: []const u8, then_needle: []const u8) Foun
     const tags = tree.nodes.items(.tag);
     for (tags, 0..) |tag, i| {
         if (tag != .if_simple) continue;
-        const node: Node.Index = @enumFromInt(i);
+        const node: Node.Index = @fromBackingInt(@intCast(i));
         const full = tree.fullIf(node) orelse continue;
         if (std.mem.indexOf(u8, tree.getNodeSource(full.ast.cond_expr), cond_needle) != null and
             std.mem.indexOf(u8, tree.getNodeSource(full.ast.then_expr), then_needle) != null)
@@ -230,7 +224,7 @@ fn findSwitchCase(tree: Ast, value: []const u8) Found {
             .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {},
             else => continue,
         }
-        const node: Node.Index = @enumFromInt(i);
+        const node: Node.Index = @fromBackingInt(@intCast(i));
         const case = tree.fullSwitchCase(node) orelse continue;
         if (case.ast.values.len != 1) continue;
         if (std.mem.eql(u8, tree.getNodeSource(case.ast.values[0]), value)) {
@@ -261,7 +255,7 @@ fn collectCalls(
             .call, .call_comma, .call_one, .call_one_comma => {},
             else => continue,
         }
-        const node: Node.Index = @enumFromInt(i);
+        const node: Node.Index = @fromBackingInt(@intCast(i));
         const span = nodeSpan(tree, node);
         if (span.start < parent_span.start or span.end > parent_span.end) continue;
 
@@ -419,64 +413,6 @@ const Builder = struct {
         try self.applied(name, 1);
     }
 
-    /// Remove one occurrence of `scope` from a test's declared log
-    /// expectations, for a warning the patch stops emitting.
-    fn dropLogExpectation(self: *Builder, name: []const u8, test_node: Node.Index, scope: []const u8) !void {
-        var calls: std.ArrayList(Call) = .empty;
-        defer freeCalls(self.gpa, &calls);
-        try collectCalls(self.gpa, self.tree, test_node, "expectLog", &calls);
-
-        if (calls.items.len != 1 or calls.items[0].params.len != 1) {
-            try self.report.record(
-                self.target,
-                name,
-                if (calls.items.len == 0) .not_found else .ambiguous,
-                0,
-            );
-            return;
-        }
-
-        const init_node = findArrayInitWithin(self.tree, calls.items[0].params[0]) orelse {
-            try self.missing(name);
-            return;
-        };
-
-        var buf: [2]Node.Index = undefined;
-        const init = self.tree.fullArrayInit(&buf, init_node) orelse {
-            try self.missing(name);
-            return;
-        };
-
-        var kept: std.ArrayList([]const u8) = .empty;
-        defer kept.deinit(self.gpa);
-        var dropped = false;
-        for (init.ast.elements) |element| {
-            const src = self.tree.getNodeSource(element);
-            if (!dropped and std.mem.eql(u8, src, scope)) {
-                dropped = true;
-                continue;
-            }
-            try kept.append(self.gpa, src);
-        }
-
-        if (!dropped) {
-            try self.missing(name);
-            return;
-        }
-
-        var rebuilt: std.ArrayList(u8) = .empty;
-        defer rebuilt.deinit(self.gpa);
-        try rebuilt.appendSlice(self.gpa, ".{");
-        for (kept.items, 0..) |src, i| {
-            try rebuilt.appendSlice(self.gpa, if (i == 0) " " else ", ");
-            try rebuilt.appendSlice(self.gpa, src);
-        }
-        try rebuilt.appendSlice(self.gpa, if (kept.items.len == 0) "}" else " }");
-
-        try self.replaceNode(init_node, try self.arena.dupe(u8, rebuilt.items));
-        try self.applied(name, 1);
-    }
-
     /// Rewrite a comment inside a node. Comments are not AST nodes, so this is
     /// an exact required-unique substring match; a reworded comment is
     /// reported rather than left contradicting the code beneath it.
@@ -506,29 +442,6 @@ const Builder = struct {
         try self.applied(name, 1);
     }
 };
-
-fn findArrayInitWithin(tree: Ast, parent: Node.Index) ?Node.Index {
-    const parent_span = nodeSpan(tree, parent);
-    const tags = tree.nodes.items(.tag);
-    for (tags, 0..) |tag, i| {
-        switch (tag) {
-            .array_init_one,
-            .array_init_one_comma,
-            .array_init_dot_two,
-            .array_init_dot_two_comma,
-            .array_init_dot,
-            .array_init_dot_comma,
-            .array_init,
-            .array_init_comma,
-            => {},
-            else => continue,
-        }
-        const node: Node.Index = @enumFromInt(i);
-        const span = nodeSpan(tree, node);
-        if (span.start >= parent_span.start and span.end <= parent_span.end) return node;
-    }
-    return null;
-}
 
 fn configSites(b: *Builder) !void {
     const guard = "validateUserAgent: mozilla guard";
@@ -562,6 +475,27 @@ fn configSites(b: *Builder) !void {
 
         if (rewritten == 0) try b.missing(expectations) else try b.applied(expectations, rewritten);
     }
+
+    // The hint printed when `--user-agent` is refused names the rule the patch removes.
+    const hint = "userAgentValidator: drop the Mozilla hint";
+    const hint_from = "\"must be printable ASCII and can't contain Mozilla\"";
+    var hint_tok: ?Ast.TokenIndex = null;
+    var hint_count: usize = 0;
+    for (0..b.tree.tokens.len) |i| {
+        const tok: Ast.TokenIndex = @intCast(i);
+        if (b.tree.tokenTag(tok) != .string_literal) continue;
+        if (!std.mem.eql(u8, b.tree.tokenSlice(tok), hint_from)) continue;
+        hint_tok = tok;
+        hint_count += 1;
+    }
+    if (hint_count > 1) {
+        try b.report.record(b.target, hint, .ambiguous, 0);
+    } else if (hint_tok) |tok| {
+        try b.replaceSpan(tokenSpan(b.tree, tok, tok), "\"must be printable ASCII\"");
+        try b.applied(hint, 1);
+    } else {
+        try b.missing(hint);
+    }
 }
 
 fn emulationSites(b: *Builder) !void {
@@ -588,7 +522,7 @@ fn emulationSites(b: *Builder) !void {
             try b.missing(rename_label);
         }
 
-        try b.dropLogCall(try std.fmt.allocPrint(b.arena, "{s}  drop silenceLog", .{label}), node, "silenceLog", null);
+        try b.dropLogCall(try std.fmt.allocPrint(b.arena, "{s}  drop the refusal log expectation", .{label}), node, "expectLog", "&.{.cdp}");
 
         // A rejected override replies with a bare result; an accepted one
         // replies against the request id the test itself sent.
@@ -625,6 +559,47 @@ fn emulationSites(b: *Builder) !void {
         }
         if (rewritten == 0) try b.missing(changed_label) else try b.applied(changed_label, rewritten);
     }
+
+    try acceptLanguageSites(b);
+}
+
+/// This test sends a Mozilla user agent alongside a locale to show the locale
+/// still applies when the user agent is refused. Patched, both apply, so the
+/// refusal warning goes away and the user agent assertion follows the request.
+fn acceptLanguageSites(b: *Builder) !void {
+    const label = "test: setUserAgentOverride acceptLanguage";
+    const node = try b.anchor(label, findTest(b.tree, "acceptLanguage drives navigator.languages\"")) orelse return;
+
+    try b.dropLogCall(label ++ "  drop the refusal log expectation", node, "expectLog", "&.{.cdp}");
+
+    try b.replaceTextInNode(
+        label ++ "  rewrite the stale comment",
+        node,
+        "// A Mozilla user agent is refused, the language still applies.",
+        "// A Mozilla user agent is accepted along with the language.",
+    );
+
+    const assert_label = label ++ "  assert the user agent is applied";
+    const ua = findStringLiteral(b.tree, node, "Mozilla") orelse {
+        try b.missing(assert_label);
+        return;
+    };
+
+    var calls: std.ArrayList(Call) = .empty;
+    defer freeCalls(b.gpa, &calls);
+    try collectCalls(b.gpa, b.tree, node, "expectEqualStrings", &calls);
+
+    // Only the assertion after the Mozilla request reads the user agent back.
+    var found: Found = .none;
+    for (calls.items) |call| {
+        if (call.params.len != 2) continue;
+        if (std.mem.indexOf(u8, b.tree.getNodeSource(call.params[1]), "getUserAgent()") == null) continue;
+        found = found.add(call.params[0]);
+    }
+
+    const param = try b.anchor(assert_label, found) orelse return;
+    try b.replaceNode(param, ua);
+    try b.applied(assert_label, 1);
 }
 
 fn networkSites(b: *Builder) !void {
@@ -694,10 +669,6 @@ fn httpClientSites(b: *Builder) !void {
         "// a Mozilla User-Agent is no longer refused",
     );
 
-    // The test declares its log expectations twice; the one-line `&.{.http}`
-    // belongs to the warning the patch removes.
-    try b.dropLogCall(label ++ "  drop the dropped-header log expectation", node, "expectLog", "&.{.http}");
-
     const assert_label = label ++ "  assert the user agent is kept";
     const ua = findStringLiteral(b.tree, node, "Mozilla") orelse {
         try b.missing(assert_label);
@@ -721,22 +692,6 @@ fn httpClientSites(b: *Builder) !void {
     const param = try b.anchor(assert_label, found) orelse return;
     try b.replaceNode(param, ua);
     try b.applied(assert_label, 1);
-}
-
-/// These suites drive HTML fixtures that set a Mozilla user agent and count
-/// the warnings the run emits. One of those warnings is the dropped header,
-/// which the patch stops producing.
-fn htmlSuiteSites(b: *Builder, test_needle: []const u8, label: []const u8) !void {
-    const node = try b.anchor(label, findTest(b.tree, test_needle)) orelse return;
-    try b.dropLogExpectation(label, node, ".http");
-}
-
-fn xmlHttpRequestSites(b: *Builder) !void {
-    try htmlSuiteSites(b, "WebApi: XHR\"", "test: WebApi XHR  drop one http log expectation");
-}
-
-fn fetchSites(b: *Builder) !void {
-    try htmlSuiteSites(b, "WebApi: fetch\"", "test: WebApi fetch  drop one http log expectation");
 }
 
 const TextEdit = struct {
@@ -819,7 +774,7 @@ pub fn patchSource(gpa: Allocator, target: Target, source: [:0]const u8, report:
 
     if (target.kind() == .text) return patchText(gpa, target, source, report);
 
-    var tree = try Ast.parse(gpa, source, .zig);
+    var tree = try Ast.parse(gpa, source, .{});
     defer tree.deinit(gpa);
     if (tree.errors.len != 0) {
         std.log.err("{s}: {d} parse error(s) before patching; refusing to touch it", .{ target.relPath(), tree.errors.len });
@@ -840,8 +795,6 @@ pub fn patchSource(gpa: Allocator, target: Target, source: [:0]const u8, report:
         .emulation => try emulationSites(&builder),
         .network => try networkSites(&builder),
         .http_client => try httpClientSites(&builder),
-        .xml_http_request => try xmlHttpRequestSites(&builder),
-        .fetch => try fetchSites(&builder),
         .help_text, .xhr_html, .fetch_html => unreachable,
     }
 
@@ -858,10 +811,10 @@ pub fn patchSource(gpa: Allocator, target: Target, source: [:0]const u8, report:
     };
     defer gpa.free(patched);
 
-    const patched_z = try gpa.dupeZ(u8, patched);
+    const patched_z = try gpa.dupeSentinel(u8, patched, 0);
     defer gpa.free(patched_z);
 
-    var out_tree = try Ast.parse(gpa, patched_z, .zig);
+    var out_tree = try Ast.parse(gpa, patched_z, .{});
     defer out_tree.deinit(gpa);
     if (out_tree.errors.len != 0) {
         std.log.err("{s}: {d} parse error(s) after patching; the edit produced invalid Zig", .{ target.relPath(), out_tree.errors.len });
@@ -967,6 +920,13 @@ test "config: guard and expectations are rewritten" {
     try expectPatch(.config,
         \\const std = @import("std");
         \\
+        \\fn userAgentValidator(str: []const u8) !void {
+        \\    validateUserAgent(str) catch |err| {
+        \\        log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII and can't contain Mozilla" });
+        \\        return error.InvalidArgument;
+        \\    };
+        \\}
+        \\
         \\pub fn validateUserAgent(ua: []const u8) !void {
         \\    for (ua) |c| {
         \\        if (!std.ascii.isPrint(c)) {
@@ -991,6 +951,13 @@ test "config: guard and expectations are rewritten" {
         \\
     ,
         \\const std = @import("std");
+        \\
+        \\fn userAgentValidator(str: []const u8) !void {
+        \\    validateUserAgent(str) catch |err| {
+        \\        log.fatal(.app, "invalid user-agent", .{ .err = err, .hint = "must be printable ASCII" });
+        \\        return error.InvalidArgument;
+        \\    };
+        \\}
         \\
         \\pub fn validateUserAgent(ua: []const u8) !void {
         \\    for (ua) |c| {
@@ -1025,7 +992,7 @@ test "emulation: prong deleted, tests renamed and re-asserted" {
         \\}
         \\
         \\test "cdp.Emulation: setUserAgentOverride ignores mozilla" {
-        \\    testing.silenceLog(&.{.not_implemented});
+        \\    testing.expectLog(&.{.cdp});
         \\
         \\    var ctx = try testing.context();
         \\    _ = try ctx.loadBrowserContext(.{ .id = "BID-UA2" });
@@ -1040,7 +1007,7 @@ test "emulation: prong deleted, tests renamed and re-asserted" {
         \\}
         \\
         \\test "cdp.Emulation: setUserAgentOverride ignores mozilla case insensitive" {
-        \\    testing.silenceLog(&.{.not_implemented});
+        \\    testing.expectLog(&.{.cdp});
         \\
         \\    var ctx = try testing.context();
         \\    _ = try ctx.loadBrowserContext(.{ .id = "BID-UA3" });
@@ -1052,6 +1019,18 @@ test "emulation: prong deleted, tests renamed and re-asserted" {
         \\
         \\    try ctx.expectSentResult(null, .{});
         \\    try testing.expectEqual(false, ctx.cdp().browser_context.?.user_agent_changed);
+        \\}
+        \\
+        \\test "cdp.Emulation: setUserAgentOverride acceptLanguage drives navigator.languages" {
+        \\    testing.expectLog(&.{.cdp});
+        \\
+        \\    var ctx = try testing.context();
+        \\    try ctx.processMessage(.{ .id = 1, .params = .{ .userAgent = "CustomBot/2.0", .acceptLanguage = "de" } });
+        \\    try std.testing.expectEqualStrings("de", ctx.cdp().browser.http_client.getAcceptLanguage());
+        \\
+        \\    // A Mozilla user agent is refused, the language still applies.
+        \\    try ctx.processMessage(.{ .id = 2, .params = .{ .userAgent = "Mozilla/5.0", .acceptLanguage = "fr-FR" } });
+        \\    try std.testing.expectEqualStrings("CustomBot/2.0", ctx.cdp().browser.http_client.getUserAgent());
         \\}
         \\
     ,
@@ -1088,6 +1067,16 @@ test "emulation: prong deleted, tests renamed and re-asserted" {
         \\
         \\    try ctx.expectSentResult(null, .{ .id = 3 });
         \\    try testing.expectEqual(true, ctx.cdp().browser_context.?.user_agent_changed);
+        \\}
+        \\
+        \\test "cdp.Emulation: setUserAgentOverride acceptLanguage drives navigator.languages" {
+        \\    var ctx = try testing.context();
+        \\    try ctx.processMessage(.{ .id = 1, .params = .{ .userAgent = "CustomBot/2.0", .acceptLanguage = "de" } });
+        \\    try std.testing.expectEqualStrings("de", ctx.cdp().browser.http_client.getAcceptLanguage());
+        \\
+        \\    // A Mozilla user agent is accepted along with the language.
+        \\    try ctx.processMessage(.{ .id = 2, .params = .{ .userAgent = "Mozilla/5.0", .acceptLanguage = "fr-FR" } });
+        \\    try std.testing.expectEqualStrings("Mozilla/5.0", ctx.cdp().browser.http_client.getUserAgent());
         \\}
         \\
     );
@@ -1171,7 +1160,6 @@ test "http client: the header-dropped assertion is flipped, its sibling is not" 
         \\    try testing.expectEqual("\"Lightpanda\";v=\"1\"", transfer.findRequestHeader("sec-ch-ua").?);
         \\
         \\    // an invalid User-Agent never enters the list
-        \\    testing.expectLog(&.{.http});
         \\    try transfer.setHeader("user-agent", "Mozilla/5.0", .{ .source = .author });
         \\    try testing.expectEqual("Lightpanda/1.0", transfer.findRequestHeader("user-agent").?);
         \\
@@ -1197,22 +1185,6 @@ test "http client: the header-dropped assertion is flipped, its sibling is not" 
         \\    // a valid author User-Agent replaces the default
         \\    try transfer.setHeader("User-Agent", "MyBot/2.0", .{ .source = .author });
         \\    try testing.expectEqual("MyBot/2.0", transfer.findRequestHeader("user-agent").?);
-        \\}
-        \\
-    );
-}
-
-test "expectLog loses exactly one scope, keeping the others" {
-    try expectPatch(.fetch,
-        \\test "WebApi: fetch" {
-        \\    testing.expectLog(&.{ .http, .js, .http });
-        \\    try testing.htmlRunner("net/fetch.html", .{});
-        \\}
-        \\
-    ,
-        \\test "WebApi: fetch" {
-        \\    testing.expectLog(&.{ .js, .http });
-        \\    try testing.htmlRunner("net/fetch.html", .{});
         \\}
         \\
     );

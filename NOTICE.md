@@ -25,8 +25,8 @@ are still rejected, and the header-smuggling checks in
 tokens and values carrying CR, LF or NUL.
 
 The patch additionally updates the upstream tests that assert the old
-behaviour, and the `--user-agent` help text, which would otherwise still tell
-you that Mozilla values are forbidden.
+behaviour, and the `--user-agent` help text and error hint, which would
+otherwise still tell you that Mozilla values are forbidden.
 
 ## Where the modification lives
 
