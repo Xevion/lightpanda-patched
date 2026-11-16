@@ -53,8 +53,9 @@ jobs:
       fail-fast: false
       matrix:
         # Linux binaries name their glibc in -Dtarget, so the floor is fixed
-        # here rather than by the runner image's own glibc. The prebuilt V8
-        # needs memfd_create (2.27); 2.28 is the RHEL 8 / manylinux_2_28 line.
+        # here rather than by the runner image's own glibc. Each floor is the
+        # lowest its prebuilt V8 links against: x86_64 needs memfd_create
+        # (2.27, rounded up to the RHEL 8 line), aarch64 needs __isoc23_* (2.38).
         include:
           - os: linux
             arch: x86_64
@@ -67,8 +68,8 @@ jobs:
           - os: linux
             arch: aarch64
             runner: ubuntu-24.04-arm
-            glibc: "2.28"
-            flags: "-Dorderfile=orderfile/lightpanda.ld -Dtarget=aarch64-linux-gnu.2.28 -Dcpu=generic"
+            glibc: "2.38"
+            flags: "-Dorderfile=orderfile/lightpanda.ld -Dtarget=aarch64-linux-gnu.2.38 -Dcpu=generic"
             required: true
           # A moving label, so a retired image can't strand this leg.
           - os: macos
